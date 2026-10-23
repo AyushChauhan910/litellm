@@ -15,19 +15,27 @@ Redis.
 """
 
 import asyncio
+import base64
+import io
+import wave
+from functools import partial
 import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, Final
 
 import pytest
 
+from litellm import Router
 from litellm.caching.caching import DualCache
+from litellm.constants import DEFAULT_IMAGE_TOKEN_COUNT
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PROJECT_ITPM_DESCRIPTOR_KEY,
     PROJECT_OTPM_DESCRIPTOR_KEY,
     RateLimitedModel,
     _AUDIO_BYTES_PER_TOKEN,
+    _resolve_media_models,
     PROXY_MaxParallelRequestsHandler_v3 as RateLimitHandler,
 )
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
@@ -51,6 +59,197 @@ def rate_limiter():
     cache = DualCache()
     handler = RateLimitHandler(internal_usage_cache=InternalUsageCache(cache))
     return handler, cache
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media_type", ["image_url", "image", "input_audio"])
+async def test_combined_tpm_rejects_media_before_dispatch(
+    rate_limiter: tuple[RateLimitHandler, DualCache], media_type: str,
+) -> None:
+    handler, cache = rate_limiter
+    media: Final = {
+        "type": media_type,
+        "image_url": {"url": "https://example.invalid/image.png", "detail": "high"},
+        "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+        "input_audio": {"data": "AAAA", "format": "wav"},
+    }
+    auth: Final = UserAPIKeyAuth(api_key=hash_token("sk-media-tpm"), tpm_limit=100)
+    data: Final = {
+        "model": "unknown-deployment",
+        "messages": [{"role": "user", "content": [media]}],
+        "max_tokens": 16,
+    }
+    with pytest.raises(ProxyRateLimitError) as exc:
+        await handler.async_pre_call_hook(
+            user_api_key_dict=auth, cache=cache, data=data, call_type="acompletion",
+        )
+    assert exc.value.status_code == 429
+
+
+@pytest.mark.parametrize("output_cap", [None, 0, 16])
+@pytest.mark.parametrize("configured_output", [None, 32])
+def test_combined_tpm_media_is_bounded_and_not_contentless(
+    rate_limiter: tuple[RateLimitHandler, DualCache],
+    output_cap: int | None, configured_output: int | None,
+) -> None:
+    handler, _ = rate_limiter
+    for image_data in ("AAAA", "A" * 4_000_000):
+        data: Final = {
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64," + image_data,
+                }},
+            ]}],
+            "n": 2,
+            **({"max_tokens": output_cap} if output_cap is not None else {}),
+        }
+        input_tokens, output_tokens = handler._estimate_input_and_output_tokens(
+            data, call_type="acompletion", configured_output_tokens=configured_output,
+        )
+        expected_output: Final = (
+            output_cap if output_cap is not None else configured_output
+            if configured_output is not None else max(
+                DEFAULT_IMAGE_TOKEN_COUNT, handler.no_max_tokens_output_floor(None),
+            )
+        )
+        assert input_tokens == DEFAULT_IMAGE_TOKEN_COUNT
+        assert output_tokens == expected_output * 2
+
+
+def test_combined_tpm_preserves_text_and_counts_each_media_block_once(
+    rate_limiter: tuple[RateLimitHandler, DualCache],
+) -> None:
+    handler, _ = rate_limiter
+    audio: Final = {
+        "type": "input_audio", "input_audio": {"data": "A" * 4_000_000, "format": "wav"},
+    }
+    image: Final = {"type": "image_url", "image_url": "https://example.invalid/image.png"}
+    data: Final = {
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd" * 10}, image, image, audio,
+        ]}], "max_tokens": 0,
+    }
+    assert handler._estimate_input_and_output_tokens(data) == (
+        10 + 2 * DEFAULT_IMAGE_TOKEN_COUNT + handler._estimate_audio_block_tokens(audio), 0,
+    )
+
+
+def test_project_itpm_fallback_counts_chat_audio_once(
+    rate_limiter: tuple[RateLimitHandler, DualCache],
+) -> None:
+    handler, _ = rate_limiter
+    audio: Final = {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+    data: Final = {
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd" * 10}, audio,
+            {"type": "image_url", "image_url": {"url": "https://example.invalid/image.png"}},
+            {"type": "unsupported_counter_block"},
+        ]}],
+    }
+    assert handler._estimate_precise_input_tokens(data, "unknown-deployment", "acompletion") == (
+        10 + DEFAULT_IMAGE_TOKEN_COUNT + handler._estimate_audio_block_tokens(audio)
+    )
+
+
+def _audio_message(seconds: int, sample_rate: int, channels: int) -> dict[str, object]:
+    output: Final = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\x00\x00" * seconds * sample_rate * channels)
+    return {"role": "user", "content": [{
+        "type": "input_audio", "input_audio": {
+            "data": base64.b64encode(output.getvalue()).decode(), "format": "wav",
+        },
+    }]}
+
+
+@pytest.mark.parametrize("sample_rate,channels", [(8000, 1), (24000, 1), (48000, 2)])
+def test_audio_estimates_follow_duration_instead_of_encoding_size(
+    rate_limiter: tuple[RateLimitHandler, DualCache], sample_rate: int, channels: int,
+) -> None:
+    handler, _ = rate_limiter
+    # OpenAI user-audio estimate, checked 2026-10-24:
+    # https://developers.openai.com/api/docs/guides/voice-latency-cost?voice-api=realtime
+    for seconds in (1, 31):
+        message: Final = _audio_message(seconds, sample_rate, channels)
+        data: Final = {"model": "gpt-audio-1.5", "messages": [message], "max_tokens": 0}
+        assert handler._estimate_input_and_output_tokens(data) == (seconds * 10, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds,admitted", [(1, True), (31, False)])
+async def test_audio_duration_drives_combined_and_project_admission(
+    rate_limiter: tuple[RateLimitHandler, DualCache], seconds: int, admitted: bool,
+) -> None:
+    handler, cache = rate_limiter
+    auth: Final = UserAPIKeyAuth(
+        api_key=hash_token("sk-duration"), tpm_limit=100, project_id="audio-project",
+        project_metadata={"model_itpm_limit": {"gpt-audio-1.5": 100}},
+    )
+    data: Final = {"model": "gpt-audio-1.5", "messages": [_audio_message(seconds, 24000, 1)], "max_tokens": 16}
+    if not admitted:
+        with pytest.raises(ProxyRateLimitError):
+            await handler.async_pre_call_hook(auth, cache, data, "acompletion")
+        return
+    await handler.async_pre_call_hook(auth, cache, data, "acompletion")
+    stash: Final = get_request_stash()
+    assert stash is not None
+    assert stash.reserved_tokens == 26
+    assert 10 <= stash.itpm_reserved_tokens < 100
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detail,admitted", [("low", True), ("high", False), ("auto", False)])
+@pytest.mark.parametrize("route", ["alias", "azure", "mixed"])
+async def test_model_specific_images_resolve_routes_before_admission(
+    detail: str, admitted: bool, route: str,
+) -> None:
+    from PIL import Image
+
+    output: Final = io.BytesIO()
+    Image.new("RGB", (1024, 1024)).save(output, format="PNG")
+    image: Final = "data:image/png;base64," + base64.b64encode(output.getvalue()).decode()
+    router: Final = Router(
+        model_list=[
+            {"model_name": "vision", "litellm_params": {"model": "openai/gpt-5.1", "api_key": "test"}},
+            {"model_name": "azure", "litellm_params": {
+                "model": "azure/custom-deployment", "base_model": "gpt-4o-mini",
+                "api_key": "test", "api_base": "https://example.invalid", "api_version": "2024-12-01-preview",
+            }, "model_info": {"base_model": "gpt-5.1"}},
+            {"model_name": "mixed", "litellm_params": {"model": "openai/gpt-5.1", "api_key": "test"}},
+            {"model_name": "mixed", "litellm_params": {"model": "openai/gpt-4o", "api_key": "test"}},
+        ], model_group_alias={"alias": "vision"},
+    )
+    cache: Final = DualCache()
+    handler: Final = RateLimitHandler(
+        internal_usage_cache=InternalUsageCache(cache), media_model_resolver=partial(_resolve_media_models, router),
+    )
+    auth: Final = UserAPIKeyAuth(api_key=hash_token("sk-image-policy"), tpm_limit=500)
+    data: Final = {"model": route, "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": image, "detail": detail}},
+    ]}], "max_tokens": 16}
+    if not admitted:
+        with pytest.raises(ProxyRateLimitError):
+            await handler.async_pre_call_hook(auth, cache, data, "acompletion")
+        return
+    await handler.async_pre_call_hook(auth, cache, data, "acompletion")
+    stash: Final = get_request_stash()
+    assert stash is not None
+    assert stash.reserved_tokens == (85 if route == "mixed" else 70) + 16
+
+
+@pytest.mark.parametrize("sample_rate,channels", [(8000, 1), (48000, 2)])
+def test_project_fallback_reuses_audio_duration_once(
+    rate_limiter: tuple[RateLimitHandler, DualCache], sample_rate: int, channels: int,
+) -> None:
+    handler, _ = rate_limiter
+    data: Final = {"model": "unknown-deployment", "messages": [
+        _audio_message(31, sample_rate, channels),
+        {"role": "user", "content": [{"type": "unsupported_counter_block"}]},
+    ]}
+    assert handler._estimate_precise_input_tokens(data, "unknown-deployment", "acompletion") == 310
 
 
 @pytest.fixture(autouse=True)

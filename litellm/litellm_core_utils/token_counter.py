@@ -3,9 +3,11 @@
 import base64
 import io
 import math
+import re
 import struct
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from itertools import accumulate
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, cast
 
 import anyio
@@ -340,6 +342,117 @@ def calculate_img_tokens(
         tile_tokens: Final = (base_tokens * 2) * tiles_needed_high_res
         total_tokens: Final = base_tokens + tile_tokens
         return total_tokens
+
+
+_IMAGE_HEADER_BASE64_CHARS: Final = 65_536
+_TILE_IMAGE_TOKEN_COSTS: Final = MappingProxyType(
+    {
+        "gpt-4o": (85, 170),
+        "gpt-4.1": (85, 170),
+        "gpt-4o-mini": (2833, 5667),
+        "gpt-5": (70, 140),
+        "gpt-5.1": (70, 140),
+        "o1": (75, 150),
+        "o1-pro": (75, 150),
+        "o3": (75, 150),
+    }
+)
+_PATCH_IMAGE_MULTIPLIERS: Final = MappingProxyType(
+    {
+        "gpt-6-astra": 1.2,
+        "gpt-5.6-sol": 1.2,
+        "gpt-5.6-terra": 1.2,
+        "gpt-5.6-luna": 1.2,
+        "gpt-5.5": 1.2,
+        "gpt-5.4": 1.2,
+        "gpt-5.4-mini": 1.2,
+        "gpt-5.4-nano": 1.2,
+        "gpt-5.2": 1.2,
+        "gpt-4.1-mini": 1.62,
+    }
+)
+
+
+def _inline_image_dimensions(data: str) -> tuple[int, int] | None:
+    separator: Final = data.find(",", 0, 256)
+    if not data.startswith("data:image/") or separator < 0 or not data[:separator].endswith(";base64"):
+        return None
+    encoded_header: Final = data[separator + 1 : separator + 1 + _IMAGE_HEADER_BASE64_CHARS]
+    try:
+        header: Final = base64.b64decode(encoded_header, validate=True)
+        image_type: Final = get_image_type(header)
+        if image_type not in ("png", "gif", "jpeg", "webp"):
+            return None
+        if image_type == "webp" and header[12:16] not in (b"VP8X", b"VP8 ", b"VP8L"):
+            return None
+        width, height = get_image_dimensions(f"data:image/{image_type};base64,{encoded_header}")
+    except (ValueError, TypeError, struct.error):
+        return None
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _patch_image_limits(model: str, detail: str) -> tuple[int, int | None] | None:
+    if model in ("gpt-5.2", "gpt-4.1-mini"):
+        return None if detail == "original" else (2048, 6144)
+    original_default: Final = model in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5")
+    effective_detail: Final = ("original" if original_default else "high") if detail == "auto" else detail
+    if effective_detail == "low":
+        return (2048, 6144) if model in ("gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano") else (512, None)
+    if effective_detail == "high":
+        return (65_535 if model == "gpt-6-astra" else 2048, 2500)
+    return (
+        (65_535, None) if model in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna") else (6000, 10_000)
+    )
+
+
+def _image_patch_count(width: int, height: int, max_dimension: int, budget: int | None) -> int:
+    dimension_scale: Final = min(1.0, max_dimension / max(width, height))
+    fitted_width: Final = max(1, round(width * dimension_scale))
+    fitted_height: Final = max(1, round(height * dimension_scale))
+    patches: Final = math.ceil(fitted_width / 32) * math.ceil(fitted_height / 32)
+    if budget is None or patches <= budget:
+        return patches
+    shrink: Final = math.sqrt(32**2 * budget / (fitted_width * fitted_height))
+    width_patches: Final = fitted_width * shrink / 32
+    height_patches: Final = fitted_height * shrink / 32
+    aligned_shrink: Final = shrink * min(
+        math.floor(width_patches) / width_patches, math.floor(height_patches) / height_patches
+    )
+    resized_width: Final = max(1, math.floor(fitted_width * aligned_shrink))
+    resized_height: Final = max(1, math.floor(fitted_height * aligned_shrink))
+    return math.ceil(resized_width / 32) * math.ceil(resized_height / 32)
+
+
+def estimate_image_tokens(model: str, data: str, detail: str = "auto") -> int:
+    """Estimate documented image policies from at most 48 KiB of inline headers, without fetching media."""
+    if detail not in ("low", "high", "auto", "original"):
+        return DEFAULT_IMAGE_TOKEN_COUNT
+    provider_model: Final = re.sub(r"^(?:openai|azure|openrouter/openai)/", "", model)
+    family: Final = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", provider_model)
+    tile_costs: Final = _TILE_IMAGE_TOKEN_COSTS.get(family)
+    multiplier: Final = _PATCH_IMAGE_MULTIPLIERS.get(family)
+    if (tile_costs is None and multiplier is None) or (tile_costs is not None and detail == "original"):
+        return DEFAULT_IMAGE_TOKEN_COUNT
+    if tile_costs is not None and detail == "low" and data.startswith(("https://", "http://")):
+        return tile_costs[0]
+    dimensions: Final = _inline_image_dimensions(data)
+    if dimensions is None:
+        return DEFAULT_IMAGE_TOKEN_COUNT
+    width, height = dimensions
+    if tile_costs is not None:
+        base_tokens, tile_tokens = tile_costs
+        if detail == "low":
+            return base_tokens
+        scale: Final = min(1.0, 2048 / max(width, height), 768 / min(width, height))
+        tiles: Final = math.ceil(max(1, math.floor(width * scale)) / 512) * math.ceil(
+            max(1, math.floor(height * scale)) / 512
+        )
+        return base_tokens + tiles * tile_tokens
+    limits: Final = _patch_image_limits(family, detail)
+    if limits is None or multiplier is None:
+        return DEFAULT_IMAGE_TOKEN_COUNT
+    max_dimension, patch_budget = limits
+    return math.ceil(_image_patch_count(width, height, max_dimension, patch_budget) * multiplier)
 
 
 TokenCounterFunction = Callable[[str], int]

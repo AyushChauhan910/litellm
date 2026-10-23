@@ -5,10 +5,12 @@ This is currently in development and not yet ready for production.
 """
 
 import asyncio
+import base64
 import binascii
 import itertools
 import json
 import logging
+import math
 import os
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence, Set
@@ -42,14 +44,19 @@ from litellm.caching.redis_batch import (
     active_request_redis_batch,
 )
 from litellm.caching.redis_cache import log_redis_failure
-from litellm.constants import DYNAMIC_RATE_LIMIT_ERROR_THRESHOLD_PER_MINUTE, INTERNAL_CALL_ORIGIN_METADATA_KEY
+from litellm.constants import (
+    DEFAULT_IMAGE_TOKEN_COUNT,
+    DYNAMIC_RATE_LIMIT_ERROR_THRESHOLD_PER_MINUTE,
+    INTERNAL_CALL_ORIGIN_METADATA_KEY,
+)
 from litellm.cost_calculator import get_usage_object
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.audio_utils.utils import calculate_request_duration
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     get_str_from_messages,
 )
 from litellm.litellm_core_utils.ptu_pricing import is_ptu_cost_attribution_enabled
-from litellm.litellm_core_utils.token_counter import offload_token_count
+from litellm.litellm_core_utils.token_counter import estimate_image_tokens, offload_token_count
 from litellm.llms.azure.ptu_capacity import normalized_tokens
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.auth.auth_utils import (
@@ -98,6 +105,7 @@ if TYPE_CHECKING:
     from opentelemetry.trace import Span as _Span
 
     from litellm.proxy.utils import InternalUsageCache as _InternalUsageCache
+    from litellm.router import Router
     from litellm.types.agents import AgentResponse
     from litellm.types.caching import RedisPipelineIncrementOperation
 
@@ -109,6 +117,7 @@ else:
 
 
 _REQUEST_RATE_LIMIT_DATA: Final = TypeAdapter(Mapping[str, object])
+_MESSAGE_CONTENT_OBJECTS: Final = TypeAdapter(list[Mapping[str, object]])
 _MCP_KEY_RPM_LIMITS: Final[TypeAdapter[dict[str, int] | None]] = TypeAdapter(dict[str, int] | None)
 
 
@@ -133,6 +142,28 @@ class RateLimitedModel:
             return None
         requested_limit: Final = limits.get(self.requested)
         return requested_limit if requested_limit is not None else limits.get(self.group)
+
+
+@dataclass(frozen=True, slots=True)
+class MediaTokenEstimate:
+    image_tokens: int = 0
+    audio_tokens: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.image_tokens + self.audio_tokens
+
+
+def _resolve_media_models(router: "Router | None", model: str, team_id: str | None) -> tuple[str, ...]:
+    if router is None:
+        return (model,)
+    return tuple(dict.fromkeys(router.resolved_litellm_models(model, team_id, use_base_model=True))) or (model,)
+
+
+def _resolve_media_models_via_proxy_router(model: str, team_id: str | None) -> tuple[str, ...]:
+    from litellm.proxy.proxy_server import llm_router
+
+    return _resolve_media_models(llm_router, model, team_id)
 
 
 def _resolve_model_group_alias_via_proxy_router(model: str) -> str | None:
@@ -502,17 +533,8 @@ GOOGLE_GENAI_NATIVE_CALL_TYPES: Final = (
     CallTypes.agenerate_content_stream.value,
 )
 RESPONSES_API_MIN_OUTPUT_TOKENS: Final = 16
-# litellm.token_counter has no per-type handling for "input_audio" content
-# blocks (unlike images, which use use_default_image_token_count) -- it
-# silently contributes 0 tokens for them. When the block carries a base64
-# payload, the estimate is derived from the decoded byte count; when the
-# block is a reference without a payload (or the payload is missing), this
-# flat per-block floor is used instead.
 DEFAULT_AUDIO_TOKEN_ESTIMATE: Final = 300
-# Conservative bytes-per-token assumption for size-based audio estimation:
-# equivalent to 8 kHz mono PCM-16 (16 000 bytes/s) at 10 tokens/s. Choosing
-# the lowest reasonable bitrate means we never under-reserve for higher-
-# quality audio recorded at the same wall-clock duration.
+_AUDIO_TOKENS_PER_SECOND: Final = 10
 _AUDIO_BYTES_PER_TOKEN: Final = 1600
 # Descriptor "key" values for project-scoped ITPM/OTPM. Distinct from
 # "model_per_project" (the combined-TPM descriptor) so both can be enforced
@@ -867,11 +889,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         ] = _resolve_ptu_team_ceiling_via_proxy_router,
         fail_closed_resolver: Callable[[], bool] = _fail_closed_rate_limit_enforcement_from_general_settings,
         force_hash_tag_grouping_resolver: Callable[[], bool] = _force_redis_hash_tag_grouping_from_litellm_settings,
+        media_model_resolver: Callable[[str, str | None], tuple[str, ...]] = _resolve_media_models_via_proxy_router,
     ):
         self.internal_usage_cache = internal_usage_cache
         self._time_provider = time_provider or datetime.now
         self._tag_rate_limit_resolver = tag_rate_limit_resolver
         self._model_group_resolver = model_group_resolver
+        self._media_model_resolver = media_model_resolver
         self._ptu_team_ceiling_resolver = ptu_team_ceiling_resolver
         self._fail_closed_resolver = fail_closed_resolver
         self._force_hash_tag_grouping_resolver = force_hash_tag_grouping_resolver
@@ -1138,6 +1162,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         min_configured_tpm_limit: int | None = None,
         call_type: str | None = None,
         configured_output_tokens: int | None = None,
+        media_estimate: MediaTokenEstimate | None = None,
     ) -> int:
         """
         Estimate total tokens this request will consume so we can reserve them
@@ -1164,6 +1189,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             min_configured_tpm_limit=min_configured_tpm_limit,
             call_type=call_type,
             configured_output_tokens=configured_output_tokens,
+            media_estimate=media_estimate,
         )
         total_estimated: Final = estimated_input_tokens + max_tokens_estimate
 
@@ -1184,6 +1210,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         call_type: str | None,
         configured_output_tokens: int | None,
         raw_estimate: int,
+        media_estimate: MediaTokenEstimate | None = None,
     ) -> int:
         """The team PTU ceiling counts Azure normalized tokens, so its reservation weighs the
         output budget the way the ceiling does instead of the raw sum the other scopes reserve."""
@@ -1194,6 +1221,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             min_configured_tpm_limit=min_configured_tpm_limit,
             call_type=call_type,
             configured_output_tokens=configured_output_tokens,
+            media_estimate=media_estimate,
         )
         normalized: Final = normalized_tokens(
             ceiling, prompt_tokens=estimated_input_tokens, completion_tokens=max_tokens_estimate
@@ -1206,6 +1234,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         min_configured_tpm_limit: int | None = None,
         call_type: str | None = None,
         configured_output_tokens: int | None = None,
+        media_estimate: MediaTokenEstimate | None = None,
     ) -> tuple[int, int]:
         """
         Estimate input tokens and output (max_tokens) budget separately, so
@@ -1232,7 +1261,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         if not isinstance(data, dict):
             return 0, 0
         translated_data: Final = self._translate_google_genai_native_request(data, call_type)
-        estimable_data: Final = translated_data if translated_data is not None else data
+        estimable_data: Final = _REQUEST_RATE_LIMIT_DATA.validate_python(
+            translated_data if translated_data is not None else data
+        )
         selected_fields: Final[tuple[object | None, object | None, object | None]] = (
             (None, None, estimable_data.get("input"))
             if call_type in RESPONSES_API_CALL_TYPES or call_type in EMBEDDING_API_CALL_TYPES
@@ -1253,6 +1284,15 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             billable_input_since_newest_compaction(raw_input) if call_type in RESPONSES_API_CALL_TYPES else raw_input
         )
 
+        model_value: Final = estimable_data.get("model")
+        estimated_media_tokens: Final = (
+            media_estimate
+            if media_estimate is not None
+            else self._estimate_message_media_tokens(
+                messages,
+                (model_value if isinstance(model_value, str) else "",),
+            )
+        ).total
         total_chars: Final = (
             len(get_str_from_messages(messages))
             if isinstance(messages, list) and messages
@@ -1267,7 +1307,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             else 0
         )
 
-        estimated_input_tokens: Final = max(1, total_chars // DEFAULT_CHARS_PER_TOKEN) if total_chars > 0 else 0
+        estimated_text_tokens: Final = max(1, total_chars // DEFAULT_CHARS_PER_TOKEN) if total_chars > 0 else 0
+        estimated_input_tokens: Final = estimated_text_tokens + estimated_media_tokens
 
         explicit_max_tokens: Final = self._get_explicit_output_cap(data, call_type)
         generates_no_output: Final = (
@@ -1283,7 +1324,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         max_tokens_estimate: Final = (
             0
             if generates_no_output
-            or (explicit_max_tokens is None and total_chars == 0 and configured_output_tokens is None)
+            or (explicit_max_tokens is None and estimated_input_tokens == 0 and configured_output_tokens is None)
             else explicit_max_tokens
             if explicit_max_tokens is not None
             else configured_output_tokens
@@ -3752,27 +3793,77 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     descriptor_key=descriptor_key,
                 )
 
+    @classmethod
+    def _estimate_message_media_tokens(cls, messages: object, models: tuple[str, ...] = ("",)) -> MediaTokenEstimate:
+        if not isinstance(messages, list):
+            return MediaTokenEstimate()
+        estimates: Final = tuple(
+            cls._estimate_content_media_tokens(message.get("content"), models)
+            for message in _MESSAGE_CONTENT_OBJECTS.validate_python(messages)
+        )
+        return MediaTokenEstimate(
+            image_tokens=sum(estimate.image_tokens for estimate in estimates),
+            audio_tokens=sum(estimate.audio_tokens for estimate in estimates),
+        )
+
+    @classmethod
+    def _estimate_content_media_tokens(cls, content: object, models: tuple[str, ...]) -> MediaTokenEstimate:
+        if not isinstance(content, list):
+            return MediaTokenEstimate()
+        blocks: Final = _MESSAGE_CONTENT_OBJECTS.validate_python(content)
+        return MediaTokenEstimate(
+            image_tokens=sum(
+                cls._estimate_image_block_tokens(block, models)
+                for block in blocks
+                if block.get("type") in ("image_url", "image")
+            ),
+            audio_tokens=sum(
+                cls._estimate_audio_block_tokens(block) for block in blocks if block.get("type") == "input_audio"
+            ),
+        )
+
+    @staticmethod
+    def _estimate_image_block_tokens(block: Mapping[str, object], models: tuple[str, ...]) -> int:
+        image_url: Final = block.get("image_url")
+        source: Final = block.get("source")
+        image: Final = _callback_kwargs_mapping(image_url if image_url is not None else source)
+        source_data: Final = image.get("data")
+        url: Final = (
+            image_url
+            if isinstance(image_url, str)
+            else image.get("url")
+            if image_url is not None or image.get("type") == "url"
+            else "data:image/unknown;base64," + source_data
+            if image.get("type") == "base64" and isinstance(source_data, str)
+            else ""
+        )
+        detail: Final = image.get("detail")
+        return max(
+            (
+                estimate_image_tokens(
+                    model,
+                    url if isinstance(url, str) else "",
+                    detail if isinstance(detail, str) else "auto",
+                )
+                for model in models
+            ),
+            default=DEFAULT_IMAGE_TOKEN_COUNT,
+        )
+
     @staticmethod
     def _estimate_audio_block_tokens(block: object) -> int:
-        """
-        Token estimate for one ``input_audio`` content block.
-
-        When the block carries a base64 ``data`` payload, the estimate comes
-        from the decoded byte count (``len(b64) * 3 // 4 // _AUDIO_BYTES_PER_TOKEN``),
-        assuming the lowest reasonable audio bitrate so we never under-reserve
-        for higher-quality recordings of the same duration.
-
-        When no payload is present (reference-only block or missing ``data``),
-        falls back to ``DEFAULT_AUDIO_TOKEN_ESTIMATE``.
-        """
-        if not isinstance(block, dict):
+        audio: Final = _callback_kwargs_mapping(_callback_kwargs_mapping(block).get("input_audio"))
+        b64_data: Final = audio.get("data")
+        if not isinstance(b64_data, str) or not b64_data:
             return DEFAULT_AUDIO_TOKEN_ESTIMATE
-        input_audio: Final = block.get("input_audio")
-        b64_data: Final = input_audio.get("data") if isinstance(input_audio, dict) else None
-        if b64_data and isinstance(b64_data, str):
-            decoded_bytes: Final = len(b64_data) * 3 // 4
-            return max(decoded_bytes // _AUDIO_BYTES_PER_TOKEN, DEFAULT_AUDIO_TOKEN_ESTIMATE)
-        return DEFAULT_AUDIO_TOKEN_ESTIMATE
+        try:
+            duration: Final = calculate_request_duration(base64.b64decode(b64_data, validate=True))
+            if duration is not None and math.isfinite(duration) and duration > 0:
+                return max(1, math.ceil(duration * _AUDIO_TOKENS_PER_SECOND))
+        except (ValueError, binascii.Error):
+            pass
+        decoded_bytes: Final = len(b64_data) * 3 // 4
+        return max(decoded_bytes // _AUDIO_BYTES_PER_TOKEN, DEFAULT_AUDIO_TOKEN_ESTIMATE)
 
     @classmethod
     def _estimate_audio_content_tokens(cls, messages: object) -> int:
@@ -3799,7 +3890,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         Drop ``input_audio`` content blocks before passing ``messages`` to
         ``token_counter``, which raises ``ValueError`` on them (no per-type
         handling, unlike images). The audio contribution is added back
-        separately via ``DEFAULT_AUDIO_TOKEN_ESTIMATE`` so the rest of the
+        separately via the duration estimate or unreadable-audio fallback so the rest of the
         message (text/images/tools) still gets counted accurately instead of
         the whole call falling back to the cheap char-count estimate.
         """
@@ -3873,7 +3964,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         state: Final = data.get("state")
         return f"{state if isinstance(state, str) else ''}\n{json.dumps(data.get('fields'), default=str)}"
 
-    def _estimate_precise_input_tokens(self, data: object, model: str | None, call_type: str | None = None) -> int:
+    def _estimate_precise_input_tokens(
+        self,
+        data: object,
+        model: str | None,
+        call_type: str | None = None,
+        media_estimate: MediaTokenEstimate | None = None,
+    ) -> int:
         """
         Model-aware input token estimate for the project ITPM reservation,
         using ``litellm.token_counter`` -- the same approach the
@@ -3937,7 +4034,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         )
         messages, selected_text, countable_tools, countable_tool_choice = selected_inputs
 
-        audio_token_estimate: Final = self._estimate_audio_content_tokens(messages)
+        audio_token_estimate: Final = (
+            media_estimate.audio_tokens if media_estimate is not None else self._estimate_audio_content_tokens(messages)
+        )
         countable_messages: Final = self._strip_audio_content_blocks(messages) if audio_token_estimate > 0 else messages
 
         try:
@@ -3958,7 +4057,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         except Exception:  # noqa: BLE001  # tokenizer failures degrade to the cheap estimate
             if call_type in RERANK_API_CALL_TYPES and isinstance(selected_text, str):
                 return max(0, len(selected_text) // DEFAULT_CHARS_PER_TOKEN)
-            estimated_input_tokens, _ = self._estimate_input_and_output_tokens(data=data, call_type=call_type)
+            estimated_input_tokens, _ = self._estimate_input_and_output_tokens(
+                data={**data, "messages": countable_messages},
+                call_type=call_type,
+                media_estimate=MediaTokenEstimate(image_tokens=media_estimate.image_tokens)
+                if media_estimate is not None
+                else None,
+            )
             return estimated_input_tokens + audio_token_estimate
 
     async def _reserve_project_io_tokens_or_raise(
@@ -3972,6 +4077,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         call_type: str | None = None,
         endpoint_type: EndpointType = EndpointType.GENERIC,
         reuses_request_slot: bool = False,
+        media_estimate: MediaTokenEstimate | None = None,
     ) -> None:
         """
         Reserve project-scoped ITPM/OTPM tokens (Bedrock Mantle-style
@@ -4003,9 +4109,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             data=data,
             min_configured_tpm_limit=min_configured_otpm_limit,
             call_type=call_type,
+            media_estimate=media_estimate,
         )
         raw_estimated_input_tokens: Final = await offload_token_count(self._estimate_precise_input_tokens)(
-            data=data, model=requested_model, call_type=call_type
+            data=data,
+            model=requested_model,
+            call_type=call_type,
+            media_estimate=media_estimate,
         )
         estimated_input_tokens: Final = max(raw_estimated_input_tokens, 1)
         estimated_output_tokens: Final = (
@@ -4323,6 +4433,35 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             )
             has_tpm_limits: Final = bool(configured_tpm_limits)
 
+            needs_media_estimate: Final = (has_tpm_limits and self.tpm_reservation_enabled) or any(
+                d["key"] in (PROJECT_ITPM_DESCRIPTOR_KEY, PROJECT_OTPM_DESCRIPTOR_KEY) for d in descriptors
+            )
+            translated_request: Final = (
+                self._translate_google_genai_native_request(data, call_type) if needs_media_estimate else None
+            )
+            media_messages: Final = (
+                None
+                if call_type
+                in RESPONSES_API_CALL_TYPES
+                + EMBEDDING_API_CALL_TYPES
+                + TEXT_COMPLETION_API_CALL_TYPES
+                + EXTRACTION_API_CALL_TYPES
+                else (translated_request if translated_request is not None else request_data).get("messages")
+            )
+            media_estimate: Final = (
+                await offload_token_count(self._estimate_message_media_tokens)(
+                    _MESSAGE_CONTENT_OBJECTS.validate_python(media_messages),
+                    self._media_model_resolver(requested_model or "", user_api_key_dict.team_id),
+                )
+                if needs_media_estimate
+                and isinstance(media_messages, list)
+                and any(
+                    isinstance(message.get("content"), list)
+                    for message in _MESSAGE_CONTENT_OBJECTS.validate_python(media_messages)
+                )
+                else None
+            )
+
             # Populated on a successful combined-TPM reservation below, so the
             # project ITPM/OTPM block further down can roll it back if a
             # different bucket in the same request subsequently hits its
@@ -4366,6 +4505,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                         min_configured_tpm_limit=min_configured_tpm_limit,
                         call_type=call_type,
                         configured_output_tokens=configured_output_tokens,
+                        media_estimate=media_estimate,
                     ),
                     1,
                 )
@@ -4390,6 +4530,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     call_type=call_type,
                     configured_output_tokens=configured_output_tokens,
                     raw_estimate=estimated_tokens,
+                    media_estimate=media_estimate,
                 )
                 if stash.ptu_ceiling is not None and ptu_estimated_tokens > stash.ptu_ceiling.tpm_limit:
                     if not reuses_request_slot:
@@ -4453,6 +4594,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 user_api_key_dict=user_api_key_dict,
                 tpm_reservation_scopes=tpm_reservation_scopes,
                 tpm_reservation_amount=tpm_reservation_amount,
+                media_estimate=media_estimate,
                 call_type=call_type,
                 endpoint_type=endpoint_type,
                 reuses_request_slot=reuses_request_slot,
