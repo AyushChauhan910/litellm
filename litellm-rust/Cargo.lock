@@ -4305,6 +4305,7 @@ version = "0.1.0"
 dependencies = [
  "testcontainers-modules",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
