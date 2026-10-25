@@ -2,7 +2,7 @@
 
 Inbound authentication uses a verifier, identity resolver, and authorizer injected into `Auth`. `Auth::from_config` composes the current master-key implementation. `Auth::new` accepts alternate implementations and an injected clock
 
-Credential extractors implement Axum's `FromRequestParts` and convert into `Credential`. The default `Bearer` extractor strictly selects a single Authorization bearer token. `Auth::with_extractor::<E, _>(state)` selects another extractor for a separate route profile. A transport credential is only a selection marker, never proof of identity
+`Bearer` and `ApiKey` implement Axum's `FromRequestParts` on typed `headers::Header` decoders, never hand-scanned strings. `Bearer` takes exactly one RFC 6750 Authorization bearer token. `ApiKey` walks a priority table of typed key headers in the Python proxy's order, and only the first present source must be well formed. `ApiKeySources` state adds a configured custom header ahead of the table and enables the `?key=` query for routes that need it. `Auth::with_extractor::<E, _>(state)` selects an extractor for a route profile. A transport credential is only a selection marker, never proof of identity
 
 `Authenticator` receives that selected credential and HTTP request parts. Transport verifiers must obtain proof from trusted server extensions, not client-supplied identity headers. It returns `VerifiedIdentity` only after verification. Request parts provide headers and trusted transport extensions for integrations. The verifier must validate any client-controlled claims before treating them as identity. There is no fallback chain after verification failure
 
@@ -12,7 +12,7 @@ Credential extractors implement Axum's `FromRequestParts` and convert into `Cred
 
 `Permissions::All`, `None`, and `Only` provide the initial policy vocabulary. `Only` matches exact typed access requests. Model requests contain both the public name and resolved deployment model. MCP requests contain the resolved server ID and upstream operation, including bare tool/prompt names and resource URIs. More expressive policy adapters can be added without changing credential verification
 
-The Axum `authenticate` middleware currently accepts one Authorization header using the existing Bearer format. Missing, duplicate, empty, or malformed credentials fail. Authentication replaces any preexisting caller extension and checks the method and matched route before dispatch. Handlers extract `AuthenticatedRequest` and authorize their parsed operation before calling a provider. Missing authenticated context fails closed
+The Axum `authenticate` middleware defaults to strict Authorization bearer extraction. Route profiles can configure `ApiKey` with `ApiKeySources`. Missing, duplicate, or malformed selected credentials fail, and an empty key header counts as absent. Authentication replaces any preexisting caller extension and checks the method and matched route before dispatch. Handlers extract `AuthenticatedRequest` and authorize their parsed operation before calling a provider. Missing authenticated context fails closed
 
 The gateway also inserts an MCP `Authorization` extension and a `SessionOwner` derived from the verified principal and credential reference. The MCP host checks the injected policy at initialization and before sending resolved upstream operations. Standalone MCP library hosts retain their existing explicitly trusted registry behavior when no policy is installed. Production mounts must install authentication and the policy extension together
 

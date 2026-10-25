@@ -5,12 +5,12 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
     middleware::from_extractor_with_state,
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::future::BoxFuture;
 use litellm_auth_types::SecretValue;
 use litellm_config::Config;
-use litellm_gateway_auth::{Auth, RequireMasterKey, hash_token};
+use litellm_gateway_auth::{ApiKey, ApiKeySources, Auth, RequireMasterKey, hash_token};
 use litellm_secrets::source::SecretSource;
 use rstest::{fixture, rstest};
 use tower::ServiceExt;
@@ -479,6 +479,86 @@ async fn route_profile_uses_only_its_selected_credentials(
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), status);
+}
+
+#[rstest]
+#[tokio::test]
+async fn api_key_extractor_selects_configured_header_and_preserves_body() {
+    let pipeline = pipeline("issuer-a", Permissions::All, Permissions::All, None);
+    let auth = pipeline
+        .auth
+        .with_extractor::<ApiKey, _>(ApiKeySources::new(Some(
+            axum::http::HeaderName::from_static("x-selected-key"),
+        )));
+    let app = Router::new()
+        .route("/protected", post(|body: String| async move { body }))
+        .layer(axum::middleware::from_fn_with_state(auth, authenticate));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/protected")
+                .header("x-selected-key", "Bearer test-token")
+                .header("authorization", "Bearer wrong-token")
+                .body(Body::from("body remains available"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        String::from_utf8(to_bytes(response.into_body(), 4096).await.unwrap().to_vec()).unwrap(),
+        "body remains available"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn api_key_extractor_accepts_standard_bearer() {
+    let pipeline = pipeline("issuer-a", Permissions::All, Permissions::All, None);
+    let auth = pipeline
+        .auth
+        .with_extractor::<ApiKey, _>(ApiKeySources::default());
+    let app = Router::new()
+        .route("/protected", post(|body: String| async move { body }))
+        .layer(axum::middleware::from_fn_with_state(auth, authenticate));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/protected")
+                .header("authorization", "Bearer test-token")
+                .body(Body::from("body"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[rstest]
+#[tokio::test]
+async fn api_key_extractor_rejects_duplicate_authorization_headers() {
+    let pipeline = pipeline("issuer-a", Permissions::All, Permissions::All, None);
+    let auth = pipeline
+        .auth
+        .with_extractor::<ApiKey, _>(ApiKeySources::default());
+    let app = Router::new()
+        .route("/protected", post(|body: String| async move { body }))
+        .layer(axum::middleware::from_fn_with_state(auth, authenticate));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/protected")
+                .header("authorization", "Bearer test-token")
+                .header("authorization", "Bearer other-token")
+                .body(Body::from("body"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[rstest]
