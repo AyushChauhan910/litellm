@@ -428,21 +428,27 @@ async fn route_permissions_are_checked_before_parsing_or_dispatch() {
     assert_eq!(app.oneshot(denied).await.unwrap().status(), 403);
 }
 
-struct CustomHeader;
+struct CustomHeader(SecretValue);
 
-impl litellm_gateway_auth::CredentialExtractor for CustomHeader {
-    fn extract(
-        &self,
-        parts: &axum::http::request::Parts,
-    ) -> Result<litellm_gateway_auth::Credential, Error> {
+impl axum::extract::FromRequestParts<()> for CustomHeader {
+    type Rejection = Error;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _: &(),
+    ) -> Result<Self, Error> {
         let value = parts
             .headers
             .get("x-test-key")
             .and_then(|value| value.to_str().ok())
             .ok_or(Error::InvalidToken)?;
-        Ok(litellm_gateway_auth::Credential::Token(SecretValue::new(
-            value,
-        )))
+        Ok(Self(SecretValue::new(value)))
+    }
+}
+
+impl From<CustomHeader> for litellm_gateway_auth::Credential {
+    fn from(value: CustomHeader) -> Self {
+        Self::Token(value.0)
     }
 }
 
@@ -459,7 +465,7 @@ async fn route_profile_uses_only_its_selected_credentials(
     let app = Router::new()
         .route("/protected", get(|| async { StatusCode::NO_CONTENT }))
         .layer(axum::middleware::from_fn_with_state(
-            pipeline.auth.with_extractor(Arc::new(CustomHeader)),
+            pipeline.auth.with_extractor::<CustomHeader, _>(()),
             authenticate,
         ));
     let response = app

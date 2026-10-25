@@ -1,6 +1,9 @@
 use std::{future::Future, pin::Pin, sync::Arc, time::SystemTime};
 
-use axum::http::{Request, request::Parts};
+use axum::{
+    extract::FromRequestParts,
+    http::{Request, request::Parts},
+};
 use litellm_auth_types::SecretValue;
 use litellm_config::Config;
 use litellm_secrets::source::SecretSource;
@@ -9,11 +12,12 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     AuthenticatedCaller, AuthenticatedRequest, Authentication, AuthenticationMethod, Authorizer,
-    Bearer, CredentialExtractor, Error, NoAdditionalPolicy, Permissions, Principal, PrincipalKind,
-    ResolvedIdentity, VerifiedIdentity,
+    Bearer, Error, NoAdditionalPolicy, Permissions, Principal, PrincipalKind, ResolvedIdentity,
+    VerifiedIdentity,
 };
 
 pub type AuthFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
+type ExtractorSelector = dyn for<'a> Fn(&'a mut Parts) -> AuthFuture<'a, Credential> + Send + Sync;
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> SystemTime;
@@ -74,7 +78,7 @@ impl IdentityResolver for LocalAdministrator {
 
 #[derive(Clone)]
 pub struct Auth {
-    extractor: Arc<dyn CredentialExtractor>,
+    extractor: Arc<ExtractorSelector>,
     authenticator: Arc<dyn Authenticator>,
     identities: Arc<dyn IdentityResolver>,
     authorizer: Arc<dyn Authorizer>,
@@ -82,6 +86,22 @@ pub struct Auth {
 }
 
 impl Auth {
+    fn extractor<E, S>(state: S) -> Arc<ExtractorSelector>
+    where
+        E: FromRequestParts<S, Rejection = Error> + Into<Credential> + Send + 'static,
+        S: Send + Sync + 'static,
+    {
+        let state = Arc::new(state);
+        Arc::new(move |parts| {
+            let state = Arc::clone(&state);
+            Box::pin(async move {
+                E::from_request_parts(parts, state.as_ref())
+                    .await
+                    .map(Into::into)
+            })
+        })
+    }
+
     pub fn new(
         authenticator: Arc<dyn Authenticator>,
         identities: Arc<dyn IdentityResolver>,
@@ -89,7 +109,7 @@ impl Auth {
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
-            extractor: Arc::new(Bearer),
+            extractor: Self::extractor::<Bearer, _>(()),
             authenticator,
             identities,
             authorizer,
@@ -103,7 +123,7 @@ impl Auth {
             secrets,
         });
         Self {
-            extractor: Arc::new(Bearer),
+            extractor: Self::extractor::<Bearer, _>(()),
             authenticator: master,
             identities: Arc::new(LocalAdministrator),
             authorizer: Arc::new(NoAdditionalPolicy),
@@ -111,12 +131,22 @@ impl Auth {
         }
     }
 
-    pub fn with_extractor(self, extractor: Arc<dyn CredentialExtractor>) -> Self {
-        Self { extractor, ..self }
+    pub fn with_extractor<E, S>(self, state: S) -> Self
+    where
+        E: FromRequestParts<S, Rejection = Error> + Into<Credential> + Send + 'static,
+        S: Send + Sync + 'static,
+    {
+        Self {
+            extractor: Self::extractor::<E, S>(state),
+            ..self
+        }
     }
 
-    pub async fn authenticate_parts(&self, request: &Parts) -> Result<AuthenticatedRequest, Error> {
-        let credential = self.extractor.extract(request)?;
+    pub async fn authenticate_parts(
+        &self,
+        request: &mut Parts,
+    ) -> Result<AuthenticatedRequest, Error> {
+        let credential = (self.extractor)(request).await?;
         self.authenticate_request(&credential, request).await
     }
 

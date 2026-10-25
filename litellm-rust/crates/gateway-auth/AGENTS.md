@@ -2,7 +2,7 @@
 
 Inbound authentication uses a verifier, identity resolver, and authorizer injected into `Auth`. `Auth::from_config` composes the current master-key implementation. `Auth::new` accepts alternate implementations and an injected clock
 
-`CredentialExtractor` selects a token or transport credential from HTTP request parts. The default `Bearer` extractor is strict. A host can supply another extractor with `Auth::with_extractor` for a separate route profile. A transport credential is only a selection marker, never proof of identity
+Credential extractors implement Axum's `FromRequestParts` and convert into `Credential`. The default `Bearer` extractor strictly selects a single Authorization bearer token. `Auth::with_extractor::<E, _>(state)` selects another extractor for a separate route profile. A transport credential is only a selection marker, never proof of identity
 
 `Authenticator` receives that selected credential and HTTP request parts. Transport verifiers must obtain proof from trusted server extensions, not client-supplied identity headers. It returns `VerifiedIdentity` only after verification. Request parts provide headers and trusted transport extensions for integrations. The verifier must validate any client-controlled claims before treating them as identity. There is no fallback chain after verification failure
 

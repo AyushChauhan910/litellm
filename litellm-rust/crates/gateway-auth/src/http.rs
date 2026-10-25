@@ -1,40 +1,10 @@
+use crate::{AccessRequest, Auth, AuthenticatedRequest, Bearer, Credential, Error};
 use axum::{
     extract::{FromRequestParts, MatchedPath, Request, State},
-    http::{header::AUTHORIZATION, request::Parts},
+    http::request::Parts,
     middleware::Next,
     response::Response,
 };
-use litellm_auth_types::SecretValue;
-
-use crate::{AccessRequest, Auth, AuthenticatedRequest, Credential, Error};
-
-pub trait CredentialExtractor: Send + Sync {
-    fn extract(&self, parts: &Parts) -> Result<Credential, Error>;
-}
-
-pub struct Bearer;
-
-impl CredentialExtractor for Bearer {
-    fn extract(&self, parts: &Parts) -> Result<Credential, Error> {
-        bearer(parts).map(Credential::Token)
-    }
-}
-
-fn bearer(parts: &Parts) -> Result<SecretValue, Error> {
-    let mut values = parts.headers.get_all(AUTHORIZATION).iter();
-    let value = values.next().ok_or(Error::InvalidToken)?;
-    if values.next().is_some() {
-        return Err(Error::InvalidToken);
-    }
-    let token = value
-        .to_str()
-        .ok()
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && !value.bytes().any(|byte| byte.is_ascii_whitespace()))
-        .ok_or(Error::InvalidToken)?;
-    Ok(SecretValue::new(token))
-}
 
 pub async fn authenticate(
     State(auth): State<Auth>,
@@ -42,7 +12,7 @@ pub async fn authenticate(
     next: Next,
 ) -> Result<Response, Error> {
     let (mut parts, body) = request.into_parts();
-    let identity = auth.authenticate_parts(&parts).await?;
+    let identity = auth.authenticate_parts(&mut parts).await?;
     let route = AccessRequest::Route {
         method: parts.method.to_string(),
         path: parts
@@ -78,8 +48,9 @@ impl FromRequestParts<Auth> for RequireMasterKey {
 
     async fn from_request_parts(parts: &mut Parts, state: &Auth) -> Result<Self, Error> {
         state.validate().await?;
+        let Bearer(token) = Bearer::from_request_parts(parts, &()).await?;
         let identity = state
-            .authenticate_request(&Credential::Token(bearer(parts)?), parts)
+            .authenticate_request(&Credential::Token(token), parts)
             .await?;
         if identity.caller().authentication().method != crate::AuthenticationMethod::MasterKey {
             return Err(Error::InvalidToken);
