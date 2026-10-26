@@ -3,14 +3,14 @@ name = "litellm-core"
 version = "1.105.0"
 description = "Library to easily interface with LLM API providers"
 readme = "README.md"
-requires-python = ">=3.10, <3.15"
+requires-python = ">=3.10, <3.16"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
     { name = "BerriAI" },
 ]
 dependencies = [
-    "fastuuid>=0.14.0,<1.0",
+    "fastuuid>=0.14.0,<1.0; python_version < '3.15'",
     "filelock>=3.16.1,<4.0",
     "httpx[http2]>=0.28.0,<1.0",
     "openai>=2.20.0,<4.0.0",
